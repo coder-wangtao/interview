@@ -1,0 +1,241 @@
+这个项目的完整流程可以分成两部分：
+管理端配置：把普通 HTTP 接口注册成 MCP 工具
+运行端调用：大模型通过 MCP 调用真实 HTTP 接口
+
+一、管理端配置流程
+
+1. 创建网关
+调用：POST /admin/save_gateway_config 保存到 mcp_gateway：gatewayId、名称、描述、版本、是否鉴权、是否启用
+
+2.导入 OpenAPI 文档（如下就是一份 OpenAPI 文档）
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "员工服务",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8701"
+    }
+  ],
+  "paths": {
+    "/api/employee/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "查询成功"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {}
+  }
+}
+POST /admin/import_gateway_protocol
+{
+  "openApiJson": "{\"openapi\":\"3.0.1\",\"info\":{\"title\":\"员工服务\",\"version\":\"1.0.0\"},\"servers\":[{\"url\":\"http://localhost:8701\"}],\"paths\":{\"/api/employee/{id}\":{\"get\":{\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}],\"responses\":{\"200\":{\"description\":\"查询成功\"}}}}},\"components\":{\"schemas\":{}}}",
+  "endpoints": [
+    "/api/employee/{id}"
+  ]
+}
+解析结果保存到：
+mcp_protocol_http：HTTP URL、方法、请求头、超时
+mcp_protocol_mapping：字段名、类型、父子关系、是否必填
+
+3. 注册 MCP 工具
+调用：POST /admin/save_gateway_tool_config 把下面几项关联起来：gatewayId + toolName + protocolId 保存到 mcp_gateway_tool。
+
+4. 配置认证信息 POST /admin/save_gateway_auth 保存到 mcp_gateway_auth：API Key、每小时调用次数、过期时间、启用状态，运行时用于建立会话鉴权和 tools/call 限流。
+
+二、MCP 客户端运行流程（SSE、Streamable HTTP）
+1.SSE
+1.1 GET 建立 SSE 长连接 GET /api-gateway/gateway_001/mcp/sse?api_key=xxx
+调用链是：RootNode：进入责任链->VerifyNode：校验网关和 API Key->SSESessionNode：创建 Session->EndNode：返回 SSE Flux、增加心跳和断线清理
+1.2 POST 发送 MCP 消息 POST /api-gateway/gateway_001/mcp/sse?sessionId=xxx
+Body：
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "tools/list",
+  "params": {}
+}
+执行链是：RootNode：如果是 tools/call，先进行限流-> SessionNode：根据 sessionId 查会话 -> MessageHandlerNode：处理 JSON-RPC，将结果写入 Session Sink -> 结果通过 GET 建立的 SSE 长连接推给客户端
+2.Streamable HTTP
+GET/POST/DELETE /api-gateway/{gatewayId}/mcp
+2.1. POST initialize 创建会话 (POST /api-gateway/gateway_001/mcp)
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2024-11-05"
+  }
+}
+执行链是：校验 API Key => 创建 Streamable Session => 处理 initialize => 在响应头返回 Session ID(Mcp-Session-Id: xxxxx)
+2.2 后续 POST：发送后续消息(携带 Mcp-Session-Id，处理 tools/list/tools/call，结果直接返回)
+2.3 GET：携带 Session ID，打开可选 SSE 通道，接收服务端主动事件
+2.4 DELETE：携带 Session ID，主动关闭并彻底删除 Session
+
+最后一步
+所有消息最终进入：JSON-RPC 方法分发层
+根据method找到对应的Handler
+initialize      InitializeHandler    返回协议版本和服务器能力
+tools/list      ToolsListHandler     返回网关下的工具及 InputSchema
+tools/call      ToolsCallHandler     调用指定工具
+resources/list  ResourcesListHandler 返回资源列表
+
+1.initialize
+从数据库读取网关名称、版本和描述，返回：
+{
+  "protocolVersion": "2024-11-05",
+  "serverInfo": {
+    "name": "员工信息查询网关",
+    "version": "1.0.0"
+  },
+  "capabilities": {
+    "tools": {
+      "listChanged": true
+    }
+  }
+}
+
+2.tools/list 
+查询：mcp_gateway_tool → mcp_protocol_http  → mcp_protocol_mapping,根据 mapping 的 parentPath 和 mcpPath 重建嵌套 JSON Schema：
+{
+  "name": "getCompanyEmployee",
+  "description": "获取公司员工信息",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "xxxRequest01": {
+        "type": "object"
+      }
+    }
+  }
+}
+3.tools/call
+执行流程：
+工具名称 → 查询工具绑定的 protocolId → 查询 HTTP 配置与参数映射 → MCP 参数转换成 HTTP 参数 → GenericHttpGateway 调真实后端 → HTTP 响应包装成 MCP JSON-RPC Response
+
+
+三、会话管理与 Redis
+SessionManagementService 负责会话完整生命周期：创建 → 查询 → 刷新访问时间 → 同步 → 过期清理 → 删除
+Redis 使用：
+Map：保存会话元数据，支持应用重启恢复
+Topic：广播 CREATE / REMOVE，通知其他实例同步缓存
+每五分钟扫描一次，30 分钟无访问则认为过期。
+需要特别注意：Redis 同步的是会话元数据，各实例重建的 Reactor Sink 并不是同一个 Sink。
+因此部署多实例时，SSE 连接和该 Session 的后续 POST 请求最好通过负载均衡保持在同一实例（粘性会话），
+否则其他实例处理出的结果不能直接写入原实例的 SSE 连接。
+
+
+
+
+
+
+
+SSE 和 Streamable HTTP 有什么区别？
+1.SSE 是老的 MCP HTTP 传输方式；Streamable HTTP 是现在推荐的新方式。Streamable HTTP 替代了 2024-11-05 版本的 HTTP+SSE transport。
+SSE大概是这样:
+Client
+  │
+  │ GET /sse
+  │──────────────────────>
+  │                       Server
+  │
+  │ <────── SSE stream ───
+  │
+  │     endpoint: /messages
+  │
+  │ POST /messages
+  │──────────────────────>
+也就是说有 GET /sse是用来建立连接，POST /messages 是用来客户端和服务器通信
+2.Streamable HTTP
+现在变成了一个 endpoint：POST /mcp
+例如：https://example.com/mcp
+Client：
+POST /mcp
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "search",
+    "arguments": {
+      "query": "hello"
+    }
+  }
+}
+Server 可以直接返回普通 JSON：
+HTTP/1.1 200 OK
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {}
+}
+也可以返回：Content-Type: text/event-stream 进行流式返回。
+
+
+这是一个基于 Spring Boot 与 DDD 架构开发的MCP网关平台，将企业已有的 OpenAPI/HTTP 接口动态转换为大模型可调用的 MCP Tool，统一提供协议解析、工具注册、API Key 鉴权、限流、会话管理及分布式会话同步能力，支持 SSE 与 Streamable HTTP 两种MCP通信模式。我的主要工作包括：
+1.按 DDD 架构拆分 Trigger、Case、Domain、Infrastructure 等模块，实现接口适配、用例编排、领域逻辑与基础设施解耦。 
+2.实现 OpenAPI 3 文档解析，通过策略模式分别解析 requestBody、query 和 path 参数，递归展开 $ref 并生成 MCP Tool 的 JSON Schema。 
+3.实现 MCP SSE 和 Streamable HTTP 双协议接入，支持 initialize、tools/list、tools/call 等 JSON-RPC 方法。
+4.使用 Reactor Flux、Sink 构建 SSE 双向通信机制，通过 sessionId 关联 POST 请求与服务端推送通道，并加入心跳及断线清理。
+5.实现 MCP 工具到后端 HTTP 接口的动态转发，根据协议配置完成路径参数替换、Query 参数拼装和 JSON Body 转换。
+6、实现 API Key 鉴权、有效期校验及工具调用限流，保障网关访问安全。基于本地 ConcurrentHashMap 与 Redis Map/Topic 实现分布式会话管理，支持会话持久化、实例间增量同步、启动恢复及过期清理。 
+技术栈或者工具主要包括：Java17、Spring Boot 3、Spring AI、Retrofit、Redis/Redisson、WebFlux、Reactor、MyBatis、MySQL、MCP、DDD。
+
+策略模式:
+2. 两个具体策略
+IProtocolAnalysisStrategy
+    ├── RequestBodyAnalysisStrategy
+    └── ParametersAnalysisStrategy
+
+RequestBodyAnalysisStrategy 负责：
+{
+  "requestBody": {
+    "content": {
+      "application/json": {
+        "schema": {
+          "$ref": "#/components/schemas/UserRequest"
+        }
+      }
+    }
+  }
+}
+
+ParametersAnalysisStrategy 负责：
+{
+  "parameters": [
+    {
+      "name": "id",
+      "in": "path",
+      "schema": {
+        "type": "string"
+      }
+    },
+    {
+      "name": "keyword",
+      "in": "query",
+      "schema": {
+        "type": "string"
+      }
+    }
+  ]
+}
+
