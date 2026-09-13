@@ -1,0 +1,176 @@
+基于 Spring Boot、Spring AI 和 DDD 架构实现的 AI 智能体配置与执行平台。
+支持通过数据库动态配置大模型、Prompt、Advisor 和 MCP 工具，并在运行时装配为 ChatClient。
+平台提供 Auto、Flow、Fixed 三种智能体执行模式，支持自主任务分析、多步骤工具调用、RAG 知识库检索及 SSE 流式响应。
+
+技术栈：
+Java 17、Spring Boot 3.4、Spring AI 1.0、MyBatis、MySQL、PostgreSQL、PGVector、MCP、CompletableFuture、SSE、Docker、DDD
+
+
+按照 DDD 思想划分 API、Trigger、Domain、Infrastructure 和 App 模块，降低业务逻辑与基础设施之间的耦合。
+设计配置驱动的 ChatClient 装配机制，根据数据库配置动态组装 OpenAiApi、模型、Prompt、Advisor 和 MCP 工具，并注册到 Spring 容器。
+基于策略模式实现 Auto、Flow、Fixed 三种执行策略，通过数据库中的策略名称动态选择执行方式。
+基于策略树实现智能体执行节点编排，支持条件路由、步骤流转和上下文共享。
+实现 Auto 多轮执行流程，通过“任务分析—精准执行—质量检查—结果总结”形成任务处理闭环，并通过最大步数限制避免无限循环。
+实现 Flow 规划执行流程，对 MCP 工具能力进行分析，生成并解析执行计划，再按顺序完成工具调用。
+接入 MCP 协议，支持 SSE、Stdio 两种传输方式，为模型提供搜索、发文、消息通知等外部工具能力。
+基于 Tika、TokenTextSplitter 和 PGVector 实现文档解析、切分、向量存储及 RAG 检索增强。
+使用线程池和 CompletableFuture 并行加载模型配置，使用 ResponseBodyEmitter 实现智能体执行过程的 SSE 流式推送。
+
+
+
+表结构
+ai_agent：agent配置表，也是工作流的开端
+ai_agent_draw_config: agent拖拽配置表
+ai_agent_flow_config: agent-client关联表
+ai_agent_task_schedule: agent任务调度表
+ai_client: client配置表
+ai_client_advisor：顾问配置表
+ai_client_api: client(openai)api表
+ai_client_config: client和其他工具的关联表
+ai_client_model: 模型配置表
+ai_client_rag_order: 知识库配置表
+ai_client_system_prompt：提示词配置表
+ai_client_tool_mcp: MCP配置表
+
+ai_agent（智能体）
+├── ai_agent_flow_config 关联 ai_client
+├── ai_agent_task_schedule（定时触发智能体）
+└── ai_agent_draw_config（前端拖拽流程原始 JSON）
+
+ai_client（AI 客户端）
+└── ai_client_config（统一关系表）
+    ├── model   ──> ai_client_model
+    ├── prompt  ──> ai_client_system_prompt
+    ├── advisor ──> ai_client_advisor
+    └── tool_mcp──> ai_client_tool_mcp
+ai_client_model
+├── api_id ──> ai_client_api
+└── ai_client_config ──> ai_client_tool_mcp
+
+ai_client_advisor（RAG Advisor）
+└── filterExpression.knowledge
+    └── 间接对应 ai_client_rag_order.knowledge_tag
+
+
+1.设计配置驱动的 ChatClient 装配机制，根据数据库配置动态组装 OpenAiApi、模型、Prompt、Advisor 和 MCP 工具，并注册到 Spring 容器。
+1.1OpenAiApi
+来自 ai_client_api 表：api_id、base_url、api_key、completions_path、embeddings_path
+注册的 Bean 名称：ai_client_api_{apiId}
+
+2.McpSyncClient
+来自 ai_client_tool_mcp 表：mcp_id、mcp_name、transport_type、transport_config、request_timeout。根据 transport_type 创建不同客户端：sse → 使用 baseUri、sseEndpoint，stdio → 使用 command、args、env
+注册的 Bean 名称：ai_client_tool_mcp_{mcpId}
+
+3.OpenAiChatModel
+主要来自 ai_client_model 表：model_id、api_id、model_name、model_type
+最终装配：
+OpenAiChatModel
+├── OpenAiApi(ai_client_model.api_id → ai_client_api.api_id → OpenAiApi Bean)
+├── modelName
+└── MCP ToolCallbacks (同时通过 ai_client_config 找到模型关联的 MCP：model → tool_mcp)
+注册的 Bean 名称：ai_client_model_{modelId}
+
+4.Advisor
+来自 ai_client_advisor 表：advisor_id、advisor_name、advisor_type、order_num、ext_param
+根据 advisor_type 创建具体 Advisor：ChatMemory → 对话记忆 Advisor、RagAnswer  → PGVector 知识库检索 Advisor
+注册的 Bean 名称：ai_client_advisor_{advisorId}
+
+5.ChatClient
+ChatClient 的主体来自 ai_client：client_id、client_name、description
+具体依赖关系来自 ai_client_config：
+client → model
+client → prompt
+client → advisor
+client → tool_mcp
+最终装配结构：
+ChatClient
+├── OpenAiChatModel
+├── defaultSystem：多个 Prompt 内容拼接
+├── defaultToolCallbacks：MCP 工具
+└── defaultAdvisors：记忆、RAG 等 Advisor
+ai_client_{clientId}
+
+2.基于策略模式实现 Auto、Flow、Fixed 三种执行策略，通过数据库中的策略名称动态选择执行方式。
+2.1Fixed的核心逻辑：按照预先配置好的顺序，串行执行多个 ChatClient，并把上一步结果交给下一步。
+
+2.2Auto的核心逻辑：分析 → 执行 → 质检 → 再执行/总结
+
+2.2.1任务分析(单独配置一个任务分析client)
+任务分析客户端接收：用户原始问题、当前执行轮次、最大执行轮次、历史执行记录，分析并输出：任务状态分析、执行历史评估、下一步策略、完成度评估、任务状态
+如果分析结果包含：任务状态: COMPLETED或者：完成度评估: 100%。则直接标记完成并进入任务总结，否则进入任务执行。
+
+2.2.2任务执行(单独配置一个任务执行client)
+任务执行客户端接收：用户原始问题 + 2.2.1任务分析 的分析策略。执行实际任务，例如：调用 MCP 工具；搜索信息；查询数据；生成内容。把结果保存，然后进入质检。
+
+2.2.3质检(单独配置一个质检client)
+任务质检客户端接收：用户原始问题 + 2.2.2任务执行 的执行结果。
+PASS
+  ↓
+2.2.4任务总结
+FAIL / OPTIMIZE
+  ↓
+step + 1
+  ↓
+回到 2.2.1任务分析 开始下一轮
+step > maxStep
+  ↓
+2.2.4任务总结
+
+2.2.4任务总结(单独配置一个任务总结client)
+任务总结客户端接收：用户原始问题 + 完整 executionHistory
+生成最终回答。即使达到最大轮数仍未通过质量检查，也会根据已有结果尽力生成总结。
+Auto 策略让四种角色客户端协作，通过任务分析、实际执行和质量监督不断循环，直到检查通过或达到最大轮数，再由总结客户端生成最终答案。
+
+2.3Flow是“先分析工具 → 再生成计划 → 解析计划 → 按计划执行”的单向流程策略。
+2.3.1 分析工具(单独配置一个分析工具client)
+让模型根据用户请求分析当前可用的 MCP 工具，包括：哪些工具适合当前任务；工具需要哪些参数；工具调用顺序；工具的限制和异常处理。
+这个阶段只做分析，不执行实际任务。结果保存
+2.3.2 生成执行计划(单独配置一个执行计划client)
+根据用户原始请求 + MCP工具分析结果，生成类似的结构化计划：
+第1步：搜索相关资料
+第2步：整理搜索结果
+第3步：生成文章内容
+第4步：发布文章
+第5步：发送通知
+将结果保存
+2.3.3 解析计划(不需要client)
+把文本计划转换成一个Map：
+stepsMap
+├── 第1步：搜索资料 → 步骤详细内容
+├── 第2步：整理结果 → 步骤详细内容
+└── 第3步：发布文章 → 步骤详细内容
+2.3.4执行(单独配置一个执行client)
+执行顺序为：第1步 → 第2步 → 第3步 → ... 每一步结果分别保存：step1Result、step2Result、step3Result
+
+总结：
+Flow：
+工具分析 → 一次性规划 → 按步骤执行 → 结束
+Auto：
+分析 → 执行 → 质量检查
+  ↑          ↓
+  └──不通过则循环
+
+3.基于策略树实现智能体执行节点编排，支持条件路由、步骤流转和上下文共享。
+
+
+4.实现 Auto 多轮执行流程，通过“任务分析—精准执行—质量检查—结果总结”形成任务处理闭环，并通过最大步数限制避免无限循环。
+
+
+5.实现 Flow 规划执行流程，对 MCP 工具能力进行分析，生成并解析执行计划，再按顺序完成工具调用。
+
+6.接入 MCP 协议，支持 SSE、Stdio 两种传输方式，为模型提供搜索、发文、消息通知等外部工具能力。
+7.基于 Tika、TokenTextSplitter 和 PGVector 实现文档解析、切分、向量存储及 RAG 检索增强。
+8.使用线程池和 CompletableFuture 并行加载模型配置，使用 ResponseBodyEmitter 实现智能体执行过程的 SSE 流式推送。
+
+
+
+
+
+
+
+
+
+
+
+
+
