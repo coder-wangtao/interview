@@ -1,0 +1,145 @@
+                     ┌──────────────────────┐
+                     │      用户请求         │
+                     └──────────┬───────────┘
+                                ↓
+                     ┌──────────────────────┐
+                     │    sshOperator       │
+                     │     总调度 Agent      │
+                     └──────────┬───────────┘
+                                │
+                 ┌──────────────┴──────────────┐
+                 ↓                             ↓
+       ┌───────────────────┐        ┌───────────────────┐
+       │ sshDiagnosisAgent │        │   sshChangeAgent  │
+       │    只读诊断        │        │    执行变更        │
+       └─────────┬─────────┘        └─────────┬─────────┘
+                 │                            │
+                 └────────────┬───────────────┘
+                              ↓
+                    ┌──────────────────┐
+                    │ executeCommand   │
+                    └────────┬─────────┘
+                             ↓
+                       SSH 远程服务器
+
+表关系
+用户
+├── chat_session
+│   ├── chat_message
+│   ├── chat_milestone
+│   ├── core_memory
+│   └── long_term_memory
+│
+└── ssh_connection
+    ├── ssh_connection_config
+    └── ssh_session_log
+
+chat_session（会话）
+   ├── 1:N chat_message（会话消息）
+   └── 1:N chat_milestone（会话里程碑）
+chat_session
+   ├── 1:N core_memory (重要、稳定、优先级较高的记忆，例如用户偏好、规则、纠正信息。)
+   └── 1:N long_term_memory (从历史对话中提取的普通长期知识，支持去重、置信度和命中次数。)
+ssh_connection（SSH连接）
+   ├── 1:1 ssh_connection_config（高级配置）
+   └── 1:N ssh_session_log（连接会话记录）
+
+
+智能运维终端
+Java 17 / Spring Boot 3 / DDD / Spring AI / Google ADK / MyBatis / MySQL / jsch / 
+面向运维场景的 AI SSH 后端：SSH 连接、终端、远程文件和对话式智能体统一收口到服务端，用户用自然语言排查问题、改配置、看日志，由 Agent 在绑定的远程机上执行命令。
+1.按DDD 拆分 api / domain / infrastructure / trigger / case 多模块，将SSH命令执行、交互式终端、远程文件传输与 AI Agent 编排解耦。
+2.基于Google ADK + Spring AI实现ReAct智能体（Root → 模型调用 → 循环决策 → 用户反馈），SSE 流式输出；聊天会话与 SSH 终端绑定，工具调用打到指定远程机。
+ReAct:思考（Reason）→ 行动（Act，调工具）→ 观察结果（Observe）→ 再思考 → … => 直到能给用户最终答案
+3.规则识别 + LLM意图识别（诊断 / 配置 / 部署 / 监控等），高置信度走规则识别（毫秒级），不足再下沉 LLM，并带 LRU 缓存与失败重分类，减少误判和重复推理。
+规则识别：不调用模型，只做关键词、正则表达式和上下文匹配。规则层会对每个意图打分。
+例如用户输入：nginx 502了，帮我看看为什么挂了
+规则同时命中了：502、挂了、“为什么……挂了”正则
+规则可能得到：intent = DIAGNOSE、confidence = 0.8、entities = {service: nginx}。因为置信度达到 0.8，系统直接使用该结果。整个过程只是内存中的字符串匹配，通常不到 1ms，不需要网络请求，也不消耗模型 token。
+“不足再下沉 LLM”：有些用户表达比较模糊，例如：服务器感觉有点慢，帮我瞧瞧。规则可能没有命中足够多的明确关键词，得到：
+DIAGNOSE: 0.5
+MONITOR:  0.3
+最高分只有 0.5，不足 0.8。此时系统把消息交给第二层 LLMIntentClassifier。
+“下沉”就是：第一层无法可靠判断，继续交给下一层处理。
+LLM 会收到类似这样的 Prompt：
+你是 SSH 运维意图识别系统。
+可选意图：
+DIAGNOSE、CONFIGURE、DEPLOY、MONITOR……
+用户输入：
+服务器感觉有点慢，帮我瞧瞧
+仅返回 JSON。
+模型可能返回：
+{
+  "intent": "DIAGNOSE",
+  "confidence": 0.75,
+  "entities": {},
+  "candidates": ["MONITOR"]
+}
+因为 LLM 置信度达到 0.5，所以最终采用 LLM 的 DIAGNOSE。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+LRU 是 Least Recently Used，意思是“最近最少使用淘汰”。缓存超过 200 条时，最久没有访问的结果先被删除。
+
+
+4.用Provider/Reducer管道动态组装Prompt（采集终端环境、任务目标、里程碑、工具摘要、长期记忆）并按 token 预算裁剪历史，缓解长对话上下文膨胀。
+Provider:用户说「帮我看 502」时，模型不能只看到这句话。Provider 会补上：你在 /var/log/nginx、最初任务是排查 502、上次 cat 报过权限错误、刚 tail 过 error.log。这些现场情报合在一起，才叫这一轮的上下文。
+（采集终端环境、任务目标、里程碑、工具摘要、长期记忆）就是Provider采集的内容，用户原话可能只有一句「帮我看下 502」。模型真正看到的，还会在后面拼上这些：
+[系统环境]     ← 终端环境：这台远程机此刻的操作系统、当前用户、工作目录。
+[当前任务]     ← 任务目标： 这次对话一开始要干的事，不是最新一句闲聊。
+[关键事件]     ← 里程碑： 对话里的转折点，不是每一句。正则扫出来的关键事件，例如：用户说「不对 / 换个思路」=> TASK_CHANGE、用户说「不要 / 停 / 别」=> USER_CORRECTION
+[工具执行摘要] ← 工具摘要: 本会话里已经跑过的工具结果的压缩版，不是完整日志
+[长期记忆]     ← 长期记忆: 跨会话存下来的经验：用户偏好、这台机环境、以前排查结论等，不是本轮聊天记录。
+
+
+Reducer:先把 50 条历史压进 8000 token：错误和最近几轮留下，中间啰嗦解释丢掉
+5.封装 SSH 执行 MCP/ADK 工具，支持智能体自动读日志、改配置、跑命令，提供连接管理、终端读写、远程文件树/上传下载等，供智能体客户端调用。
+
+
+
+
+
+
+
+chatSessionId 与 terminalSessionId有联系：把「AI 聊天会话」和「某台机器上的 SSH 终端」绑在一起。
+SessionId [某台机器上的 SSH 终端]
+   ├── ChannelSftp（文件传输通道）走 SFTP 协议，不是在 Shell 里敲 ls/cat。调用的是 ls()、get()、put()、mkdir() 这类 API。
+   ├── ChannelExec（命令执行通道）一次性执行：「跑这一条命令」，把 stdout/stderr 读完，拿 exit code，通道关掉。没有交互式 prompt。ssh user@host 'ls /var/log'（跑完一条命令就结束）
+   └── ChannelShell（交互式终端通道）：开一个带 PTY 的真正 Shell（bash/zsh），有当前目录、环境变量、历史、prompt。通道会一直活着，你往里写什么它就执行什么。ssh user@host 然后一直打字（交互式终端）
+
+
+
+connectionId 一台已保存的 SSH 主机（账号、地址）
+        ↓ POST /api/v1/ssh/connect
+真正连上这台机器（JSch Session）
+        ↓ POST /api/v1/ssh/terminal/open  （入参才是 connectionId）
+terminalSessionId     在这台机器上新开的一条 Shell 通道
+        ↓ POST /api/v1/ssh/agent/bind_terminal
+绑到某个 AI 聊天会话
+connectionId：SSH 连接配置/活连接，来自创建连接、再 connect。文件树、SFTP 也用它。
+terminalSessionId：打开终端后返回的 sessionId。openTerminal 里用 UUID 新生成，前端读写、AI 执行命令都用它。
+
+ChannelSftp（文件传输通道）：ls()、get()、put()、mkdir()是根据connectionId查connection配置，之后生成Sftp操作文件。
+ChannelExec（命令执行通道）：ls()、get()、put()、mkdir()操作文件的时候 有sudo命令，就走ChannelExec，一次性执行命令。
+ChannelShell（交互式终端通道）：开一个网页终端 + AI 在这个终端里执行命令。
+
+
+自定义ADK Session 服务
+默认 ADK Session 更偏向“完整记录 Agent 运行过程”，而这个项目希望 Session 只保存“对后续 Agent 运行真正有用的轻量信息”。
+自定义 Google ADK 的 MemoryService
+实际上是一个空实现 / 占位实现（Stub）：它不会真正保存 Session，也不会真正搜索历史记忆。
