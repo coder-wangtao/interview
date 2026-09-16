@@ -193,4 +193,25 @@ LLM 层（100–500ms）：规则吃不准再让小模型分
 
 
 
-
+你按下 pwd Enter
+        ↓
+     xterm.js
+        ↓
+发送 "pwd\n"
+        ↓
+     WebSocket
+        ↓
+      Axum
+        ↓
+   portable-pty
+        ↓
+      bash
+        ↓
+返回 "/home/user"
+        ↓
+     WebSocket
+        ↓
+     xterm.js
+        ↓
+浏览器显示：
+/home/user
