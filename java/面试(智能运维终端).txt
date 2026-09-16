@@ -45,8 +45,14 @@ ssh_connection（SSH连接）
    └── 1:N ssh_session_log（连接会话记录）
 
 
-智能运维终端
-Java 17 / Spring Boot 3 / DDD / Spring AI / Google ADK / MyBatis / MySQL / jsch / 
+AI 辅助编码与 SSH 智能运维平台
+基于 Spring Boot + DDD 构建AI Coding/SSH运维后端，将终端、文件与 Agent 工具统一放到服务端执行。
+融合 ADK / Spring AI / LangChain4j，YAML 装配多场景 Agent；自研 ReAct 节点链 + Supervisor（SSE 流式、413 压缩重试、Token 预算、死循环检测）；
+打通本地编码与远程 SSH 双工具面，配合五层权限守卫、人机确认与读写并发隔离；
+实现规则+LLM 意图路由、任务拆解、会话记忆与核心记忆持久化。
+
+
+Java 17、Spring Boot 3.4、Spring AI、Google ADK、LangChain4j、xfg-wrench 策略树、MyBatis、MySQL、Redis、JSch、SSE/NDJSON、MCP Tools、Docker Compose
 面向运维场景的 AI SSH 后端：SSH 连接、终端、远程文件和对话式智能体统一收口到服务端，用户用自然语言排查问题、改配置、看日志，由 Agent 在绑定的远程机上执行命令。
 1.按DDD 拆分 api / domain / infrastructure / trigger / case 多模块，将SSH命令执行、交互式终端、远程文件传输与 AI Agent 编排解耦。
 2.基于Google ADK + Spring AI实现ReAct智能体（Root → 模型调用 → 循环决策 → 用户反馈），SSE 流式输出；聊天会话与 SSH 终端绑定，工具调用打到指定远程机。
@@ -77,23 +83,6 @@ DIAGNOSE、CONFIGURE、DEPLOY、MONITOR……
 }
 因为 LLM 置信度达到 0.5，所以最终采用 LLM 的 DIAGNOSE。
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 LRU 是 Least Recently Used，意思是“最近最少使用淘汰”。缓存超过 200 条时，最久没有访问的结果先被删除。
 
 
@@ -109,8 +98,6 @@ Provider:用户说「帮我看 502」时，模型不能只看到这句话。Prov
 
 Reducer:先把 50 条历史压进 8000 token：错误和最近几轮留下，中间啰嗦解释丢掉
 5.封装 SSH 执行 MCP/ADK 工具，支持智能体自动读日志、改配置、跑命令，提供连接管理、终端读写、远程文件树/上传下载等，供智能体客户端调用。
-
-
 
 
 
@@ -143,3 +130,24 @@ ChannelShell（交互式终端通道）：开一个网页终端 + AI 在这个�
 默认 ADK Session 更偏向“完整记录 Agent 运行过程”，而这个项目希望 Session 只保存“对后续 Agent 运行真正有用的轻量信息”。
 自定义 Google ADK 的 MemoryService
 实际上是一个空实现 / 占位实现（Stub）：它不会真正保存 Session，也不会真正搜索历史记忆。
+
+
+
+YAML 驱动的多框架 Agent 运行时
+融合 Google ADK（Runner/Session/Tool）、Spring AI（ChatModel/MCP）、LangChain4j。通过 YAML 声明模型、指令、MCP 工具、Skills、子智能体和工作流（loop/parallel/sequential），启动时由 ArmoryService 按策略树装配。同一入口同时覆盖编码助手与 SSH 运维，支持 OpenAI 兼容模型热切换；意图识别模型与主对话模型可独立配置。
+
+自研 ReAct 引擎 + Supervisor 监督
+节点链为 RootNode → TaskBreakdownNode → AiCallNode → ToolCallNode → LoopDecisionNode → UserFeedbackNode。外层 AgentLoopExecutor 做监督：30s 空闲探测、最长约 10 分钟空闲超时、Token 预算预警、死循环检测、客户端断开取消。遇 413 Payload Too Large 时触发上下文压缩（优先 AI 摘要，失败再按优先级裁剪）并最多重试 3 次。对话以 SSE + NDJSON 长连接流式下发思考、工具调用与执行结果。
+
+本地开发与远程 SSH 双通道工具面
+本地侧提供读写/搜索/创建/删除文件、执行 Shell、编译、单测、Lint；远程侧通过 JSch 管理 SSH 连接与终端会话，支持命令执行、文件树、读写搜索。聊天会话可绑定 terminalSessionId，实现「对话驱动远程运维」。另通过 CommandDispatcher 把部分指令经 SSE 下发到前端执行并回收结果，形成「服务端决策、客户端落地」的混合执行模型。
+
+企业级安全与并发控制
+PermissionGuard 五层递进：参数结构校验 → 40+ 危险命令/敏感文件正则（如 rm -rf /、磁盘格式化、Fork 炸弹、强推主分支）→ 模糊命令 AI 二次分类 → 未知工具拒绝兜底 → 同会话连续拒绝后断路器降级。删除、改配置等操作为 CONDITIONAL，经 PermissionResolve 接口等人机确认后再唤醒阻塞执行。ToolConcurrencyController 让只读工具最多 5 路并发，写/执行类工具串行，避免远程状态互相覆盖。
+
+分级意图识别与复杂任务拆解
+IntentService：规则分类（置信度 ≥ 0.8 直接命中，耗时 < 1ms）→ LLM 分类（100–500ms），缓存键用 SHA-256，LRU 容量 200，并维护会话上下文做指代消解。复杂请求（部署、重构、迁移、全流程等）由 TaskBreakdownService 拆成 2–10 个子任务（标题、描述、预期工具），按 session 复用，驱动后续 ReAct 逐步执行。
+
+上下文压缩、记忆与可观测性
+混合裁剪历史消息，默认 Token 预算约 8000；工具结果智能截断。会话、消息、里程碑入库；CoreMemoryService 维护规则/偏好/纠正类长期记忆（上限 50 条，冷记忆淘汰），注入 Prompt。子代理最多 3 轮、120s 超时，防止无限循环。配套 Docker Compose 拉起 MySQL、Redis 及应用，便于环境复现。
+
