@@ -1,0 +1,36 @@
+public interface IUserService {
+    void query();
+}
+
+public class UserService implements IUserService {
+    @Override
+    public void query() {
+        System.out.println("query");
+    }
+}
+
+JDK：通过Proxy.newProxyInstance(...)，最终得到的代理对象，本质上类似：
+class UserServiceProxy implements IUserService {
+    private UserService target;
+
+    public void query() {
+        // AOP逻辑
+        target.query();
+    }
+}
+
+CGLIB
+CGLIB 可以理解成生成：
+class UserServiceProxy extends UserService {
+    @Override
+    public void query() {
+        // AOP逻辑
+        super.query();
+    }
+}
+
+所以两者的核心差异就是：
+JDK：
+代理对象 implements 接口
+CGLIB：
+代理对象 extends 目标类
