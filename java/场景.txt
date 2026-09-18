@@ -1,0 +1,88 @@
+让我设计一个用户连续签到多少天，会给用户一个奖励的功能
+1.日签表:日历真源，一行一天，唯一键防重复签。
+CREATE TABLE user_checkin_day (
+  id            BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id       BIGINT NOT NULL,
+  activity_id   BIGINT NOT NULL,
+  checkin_date  DATE   NOT NULL,          -- 活动时区的业务日
+  source        TINYINT NOT NULL,         -- 1 当日签  2 补签
+  signed_at     DATETIME NOT NULL,
+  UNIQUE KEY uk_user_act_day (user_id, activity_id, checkin_date)
+);
+2.连签表:一段连续日历只留一行：start_date 是这段从哪天开始，续签对这一行 +1，并更新 last_date。
+CREATE TABLE user_checkin_streak (
+  id            BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id       BIGINT NOT NULL,
+  activity_id   BIGINT NOT NULL,
+  start_date    DATE   NOT NULL,          -- 查询键：从哪天开始的这一段
+  streak_days   INT    NOT NULL,          -- 已连续天数
+  last_date     DATE   NOT NULL,          -- 这段最后签到日
+  updated_at    DATETIME NOT NULL,
+  UNIQUE KEY uk_user_act_start (user_id, activity_id, start_date),
+  KEY idx_user_act_last (user_id, activity_id, last_date)
+);
+
+3.补签表
+REATE TABLE user_makeup_log (
+  id            BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id       BIGINT NOT NULL,
+  activity_id   BIGINT NOT NULL,
+  makeup_date   DATE   NOT NULL,          -- 被补上的那天，必须 < 今天
+  card_cost     INT    NOT NULL DEFAULT 1,
+  before_start  DATE   NULL,              -- 合并前左侧段 start
+  after_start   DATE   NOT NULL,          -- 完成后的段 start
+  used_at       DATETIME NOT NULL,
+  UNIQUE KEY uk_user_act_makeup (user_id, activity_id, makeup_date)
+);
+4.补签卡钱包：每个用户在每个活动里有多少张补签卡，以及发过、用过多少。
+CREATE TABLE user_makeup_wallet (
+  user_id        BIGINT NOT NULL,
+  activity_id    BIGINT NOT NULL,
+  remain_count   INT NOT NULL DEFAULT 0,
+  granted_count  INT NOT NULL DEFAULT 0,
+  used_count     INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, activity_id)
+)
+
+
+
+START TRANSACTION;
+-- 1. 扣 1 张补签卡（没卡则 ROW_COUNT=0，整单回滚）
+UPDATE user_makeup_wallet
+SET remain_count = remain_count - 1,
+    used_count   = used_count + 1
+WHERE user_id = 1001
+  AND activity_id = 100
+  AND remain_count >= 1;
+-- 2. 补上这一天（已签过会撞唯一键，回滚）
+INSERT INTO user_checkin_day
+  (user_id, activity_id, checkin_date, source, signed_at)
+VALUES
+  (1001, 100, '2026-02-03', 2, NOW());
+-- 3. 锁住该用户这个活动的连签段，查出左右邻居
+SELECT id, start_date, streak_days, last_date
+FROM user_checkin_streak
+WHERE user_id = 1001 AND activity_id = 100
+FOR UPDATE;
+-- 左段：贴着补签日前一天
+-- last_date = 2026-02-02  →  start=2026-02-01, days=2
+-- 右段：贴着补签日后一天
+-- start_date = 2026-02-04 →  start=2026-02-04, days=2, last=2026-02-05
+-- 4. 左右都有：合并到左侧，删掉右侧
+UPDATE user_checkin_streak
+SET streak_days = streak_days + 1 + 2,   -- 左2 + 补1 + 右2 = 5
+    last_date   = '2026-02-05',          -- 用右侧的 last
+    updated_at  = NOW()
+WHERE user_id = 1001
+  AND activity_id = 100
+  AND start_date = '2026-02-01';
+DELETE FROM user_checkin_streak
+WHERE user_id = 1001
+  AND activity_id = 100
+  AND start_date = '2026-02-04';
+-- 5. 记补签流水
+INSERT INTO user_makeup_log
+  (user_id, activity_id, makeup_date, card_cost, before_start, after_start, used_at)
+VALUES
+  (1001, 100, '2026-02-03', 1, '2026-02-01', '2026-02-01', NOW());
+COMMIT;
