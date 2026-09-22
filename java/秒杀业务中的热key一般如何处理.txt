@@ -1,0 +1,10 @@
+
+
+是的：即使 Redis Cluster，一件商品的库存 key 也只落在一个 master 上。 
+Cluster 按 key 做 hash 分片，不把同一个 key 拆到多个节点。
+秒杀把几万 QPS 打在 stock:sku:10001 上，就是单点打满 CPU、网卡和连接，和有没有集群无关。
+
+
+
+
+单一商品热key问题，根据库存分桶，按照用户hash去访问不同的桶，从而降低单key并发

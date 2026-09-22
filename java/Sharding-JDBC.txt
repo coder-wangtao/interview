@@ -1,0 +1,32 @@
+Sharding-JDBC
+现在叫 ShardingSphere-JDBC，是 Apache ShardingSphere 的客户端方案。
+
+它不是独立服务器，而是 套在 JDBC 外面的一层。Java 应用还是写 DataSource / MyBatis，SQL 发给它之后，由它：
+解析 SQL
+按分片键算出去哪个库、哪张表
+改写 SQL，真正去连那些 MySQL
+把多库结果合并回来
+应用和中间件在 同一个 JVM 进程里，少一次网络跳转，延迟相对低。
+
+限制也很直接：
+只服务 Java（走 JDBC 的语言）
+每个应用都要引入依赖、跟着升级
+应用往往会和 所有分片库建连接，分片一多，连接数容易爆炸
+适合：技术栈基本是 Java、分片规则不太变态、能接受每个服务自己带一份分片逻辑。
+
+
+Mycat
+Mycat 是 独立部署的 MySQL 代理（Proxy）。
+应用不直连 MySQL，而是连 Mycat。Mycat 对外假装自己是一台 MySQL：你用任何语言的 MySQL 驱动都能连。它收到 SQL 后再拆到后面的真实库表。
+Java / Go / PHP 应用  →  Mycat（像一台 MySQL）  →  多台真实 MySQL
+
+优点：
+对应用透明，不限语言
+分片规则、升级集中在 Proxy 上改，不用每个应用发版
+
+代价：
+请求 多一跳，多一层要保活、扩容、排障
+SQL 兼容取决于 Mycat 能解析、改写多少
+Mycat 1.x 老、社区一般；后面有 Mycat2，和当年很多人用的不是同一代
+适合：多语言、希望业务尽量当「只有一台库」来连。
+

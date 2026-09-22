@@ -1,0 +1,78 @@
+MyBatis 经常要对任意对象做这种操作：
+配置注入：把 XML 里的 driver、url 写进 DataSource
+参数取值：#{user.name}、#{students[0].id}
+结果映射：把列值写进 POJO
+
+
+metaObject.setValue("students[0].id", "001");
+
+MetaObject.setValue("students[0].id")
+  → 拆成 students[0] + id
+  → BeanWrapper.get(students[0])
+       → getName() 取出 List
+       → list.get(0) 得到 Student
+  → 把 Student 再包成 MetaObject
+  → setValue("id", "001")
+       → Student.setId("001")
+
+
+SQL 里经常出现 #{user.name}、#{list[0].id}，配置里要把 driver、url 灌进 DataSource。对象类型不固定，
+路径还可能嵌套。如果每次手写反射，代码会散、会慢、也难维护。
+
+MyBatis 反射模块是对 JDK 反射的封装，目的是用属性表达式统一读写任意对象。
+Reflector 把类的 getter/setter 缓存成 Invoker；PropertyTokenizer 拆 a.b[0].c；
+MetaObject 按层递归，交给 BeanWrapper/MapWrapper 真正调用。
+这样参数绑定、结果映射、配置注入都走同一套 API，而且类信息只反射一次，后续走缓存。
+
+update/insert/delete
+三种写操作的差别只在 SQL 语句本身（INSERT / UPDATE / DELETE），执行路径是同一条。
+select 调用的是 executor.query。
+官方 MyBatis 也是这个设计：增删改都对应 JDBC 的 executeUpdate，返回受影响行数。
+
+
+一级缓存
+一级缓存是 SqlSession 级别的缓存，默认开启，通常无法关闭。
+同一个 SqlSession 中执行完全相同的查询，第二次会直接使用缓存：
+SqlSession session = factory.openSession();
+IActivityDao dao = session.getMapper(IActivityDao.class);
+dao.queryActivityById(req); // 查询数据库
+dao.queryActivityById(req); // 命中一级缓存
+session.close(); // 一级缓存失效
+以下情况会清空或失效：
+SqlSession 关闭；
+执行 insert、update、delete；
+调用 commit()、rollback() 或 clearCache()；
+查询配置要求刷新缓存；
+查询语句、参数、分页条件等缓存键不相同。
+
+二级缓存
+二级缓存是 Mapper 的 namespace 级别缓存，可以在不同 SqlSession 之间共享，通常需要主动配置开启。
+<cache eviction="FIFO" flushInterval="600000" size="512" readOnly="true"/>
+eviction="FIFO"：缓存淘汰策略为先进先出。最早放入缓存的数据优先被移除。
+flushInterval="600000"：每隔 600000 毫秒刷新一次，即约 10 分钟清空缓存。
+size="512"：最多缓存 512 个对象或引用，超过后按 FIFO 策略淘汰。
+readOnly="true"：缓存对象只读，多个调用者可能拿到同一个对象引用，性能较高，但不能修改返回对象，否则可能影响其他查询结果。
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:context="http://www.springframework.org/schema/context"
+       xmlns:aop="http://www.springframework.org/schema/aop"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-3.0.xsd     http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context-3.0.xsd http://www.springframework.org/schema/aop http://www.springframework.org/schema/aop/spring-aop-3.0.xsd"
+       default-autowire="byName">
+    <context:component-scan base-package="cn.bugstack"/> 扫描 cn.bugstack 包及其子包中的组件
+
+    <aop:aspectj-autoproxy/> .开启 AOP 自动代理，让 Spring 识别 @Aspect 等切面配置，并为目标 Bean 创建代理对象。
+
+    <bean id="sqlSessionFactory" class="cn.bugstack.middleware.mybatis.spring.SqlSessionFactoryBean">
+        <property name="resource" value="mybatis-config-datasource.xml"/> 注册自定义的 SqlSessionFactoryBean，并把 MyBatis 配置文件路径传给它。
+    </bean>
+
+    <bean class="cn.bugstack.middleware.mybatis.spring.MapperScannerConfigurer">
+        <!-- 注入sqlSessionFactory -->
+        <property name="sqlSessionFactory" ref="sqlSessionFactory"/>
+        <!-- 给出需要扫描Dao接口包 --> 扫描 DAO 接口
+        <property name="basePackage" value="cn.bugstack.middleware.mybatis.spring.test.dao"/>
+    </bean>
+</beans>
